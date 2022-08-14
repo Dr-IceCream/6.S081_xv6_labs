@@ -1,0 +1,2 @@
+ 第0页包含date and text部分，第1页包含guard page用以保护堆栈，第2页是stack；用户态运行的时候不可以读取/写入第1页映射的内存，因为这部分是用来防止溢出保护stack的，不用来读写。这一点从代码中也可以看见。
+ 三个测试返回-1的条件（失败条件）分别是srcva >= p->sz； srcva+len >= p->sz ；srcva+len < srcva；第三个测试的srcva+len < srcva是为了检测溢出，因为srcva和len都是uint64无符号64位整型数，例如srcva=p->sz+1，len=0xFFFFFFFFFFFFFFFF即可满足上述一二测试不返回-1而第三测试返回-1
