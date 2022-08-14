@@ -1,0 +1,231 @@
+diff --git a/Makefile b/Makefile
+index 1fa367e..f5da769 100644
+--- a/Makefile
++++ b/Makefile
+@@ -175,7 +175,7 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
+-
++	$U/_alarmtest\
+ 
+ 
+ 
+diff --git a/answers-traps.txt b/answers-traps.txt
+new file mode 100644
+index 0000000..5e591a7
+--- /dev/null
++++ b/answers-traps.txt
+@@ -0,0 +1,3 @@
++aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
++aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
++aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 4b9bbc0..efa2c22 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -80,6 +80,7 @@ int             pipewrite(struct pipe*, uint64, int);
+ void            printf(char*, ...);
+ void            panic(char*) __attribute__((noreturn));
+ void            printfinit(void);
++void            backtrace();
+ 
+ // proc.c
+ int             cpuid(void);
+diff --git a/kernel/printf.c b/kernel/printf.c
+index e1347de..128f0d4 100644
+--- a/kernel/printf.c
++++ b/kernel/printf.c
+@@ -121,6 +121,7 @@ panic(char *s)
+   printf("panic: ");
+   printf(s);
+   printf("\n");
++  backtrace();
+   panicked = 1; // freeze uart output from other CPUs
+   for(;;)
+     ;
+@@ -132,3 +133,16 @@ printfinit(void)
+   initlock(&pr.lock, "pr");
+   pr.locking = 1;
+ }
++void backtrace() {
++uint64 fp = r_fp();
++  printf("backtrace:\n");
++  uint64 page_end = PGROUNDUP(fp);
++  while (1) {
++    if (fp == page_end)
++      break;
++    printf("%p\n", *(uint64*)(fp - 8));
++
++    fp = *(uint64*)(fp - 16);
++  }
++}
++
+diff --git a/kernel/proc.c b/kernel/proc.c
+index dab1e1d..4e2b03f 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -126,6 +126,10 @@ found:
+   memset(&p->context, 0, sizeof(p->context));
+   p->context.ra = (uint64)forkret;
+   p->context.sp = p->kstack + PGSIZE;
++  p->interval = 0;
++  p->handler = 0;
++  p->passedticks = 0;
++  p->trapframecopy = 0; 
+ 
+   return p;
+ }
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 9c16ea7..2af3beb 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -103,4 +103,8 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  int interval;                // alarm interval 
++  uint64 handler;              // pointer of handler function
++  int passedticks;             // ticks have passed
++  struct trapframe* trapframecopy; //copy of trapframe 
+ };
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 0aec003..7f583c9 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -6,6 +6,15 @@ r_mhartid()
+   asm volatile("csrr %0, mhartid" : "=r" (x) );
+   return x;
+ }
++//read the fp reg value
++static inline uint64
++r_fp()
++{
++  uint64 x;
++  asm volatile("mv %0, s0" : "=r" (x) );
++  return x;
++}
++
+ 
+ // Machine Status Register, mstatus
+ 
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index c1b3670..eb079af 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,6 +104,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
++extern uint64 sys_sigalarm(void);
++extern uint64 sys_sigreturn(void);
+ 
+ static uint64 (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -127,6 +129,8 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_sigalarm]  sys_sigalarm,
++[SYS_sigreturn] sys_sigreturn,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..382d781 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_sigalarm  22
++#define SYS_sigreturn 23
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index e8bcda9..137a34f 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -70,6 +70,7 @@ sys_sleep(void)
+     sleep(&ticks, &tickslock);
+   }
+   release(&tickslock);
++  backtrace(); //for lab5-2
+   return 0;
+ }
+ 
+@@ -95,3 +96,32 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++// lab4-3
++uint64 sys_sigreturn(void) {
++  struct proc* p = myproc();
++  // trapframecopy have had the copy
++  if(p->trapframecopy != p->trapframe + 512) {
++    return -1;
++  }
++  memmove(p->trapframe, p->trapframecopy, sizeof(struct trapframe)); //
++  p->passedticks = 0;     // reset =0
++  p->trapframecopy = 0;    // reset copy pointer
++  return 0;
++}
++// lab4-3
++uint64 sys_sigalarm(void) {
++    int interval;
++    uint64 handler;
++    struct proc *p;
++    // ensure the interval >= 0
++    if (argint(0, &interval) < 0 || argaddr(1, &handler) < 0 || interval < 0) {
++        return -1;
++    }
++    p = myproc();
++    p->interval = interval;
++    p->handler = handler;
++    p->passedticks = 0;    // reset the passedticks
++
++    return 0;
++}
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..1674f3d 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -76,6 +76,15 @@ usertrap(void)
+   if(p->killed)
+     exit(-1);
+ 
++  // lab4-3
++  if(which_dev == 2){   // timer interrupt
++    // passedticks++
++    if(p->interval != 0 && ++p->passedticks == p->interval){
++      p->trapframecopy = p->trapframe + 512;
++      memmove(p->trapframecopy,p->trapframe,sizeof(struct trapframe));
++      p->trapframe->epc = p->handler;   // execute handler()
++    }
++  }
+   // give up the CPU if this is a timer interrupt.
+   if(which_dev == 2)
+     yield();
+diff --git a/user/user.h b/user/user.h
+index b71ecda..57404e0 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -23,6 +23,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int sigalarm(int ticks, void (*handler)());
++int sigreturn(void);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..fef7388 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("sigalarm"); 
++entry("sigreturn");
